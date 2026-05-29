@@ -92,16 +92,17 @@ This version includes:
 
 with Streamlit dark mode enabled by default.
 
+## Latest fix: YouTube sign-in / 403 reliability
 
-## Sign-in / 403 fix
+This version fixes the main issues from the Streamlit logs:
 
-This version does **not** label every YouTube failure as DRM. It separates:
+- Corrects the bgutil `server_home` path to point to `~/bgutil-ytdlp-pot-provider/server`
+- Clones the matching bgutil provider version `1.3.1`
+- Uses `npm ci` for a deterministic provider build
+- Removes baked-in anonymous cookies
+- Adds an Advanced cookies.txt uploader for per-conversion YouTube sign-in / 403 cases
+- Uses cookies only temporarily, then deletes the temp file
+- Avoids client profiles that can produce misleading DRM errors
+- Aggregates yt-dlp attempt errors into a clearer message
 
-- real DRM messages
-- YouTube sign-in / bot-check messages
-- cloud-server 403 blocks
-- format availability errors
-
-For videos you own or have permission to access, the app includes an **Advanced: YouTube sign-in fix** section where a user can upload a `cookies.txt` file for the current conversion. The cookies file is written to a temporary file, used by yt-dlp, then deleted.
-
-The bgutil PO-token provider path was also fixed so `server_home` points to the required `~/bgutil-ytdlp-pot-provider/server` directory.
+Some YouTube videos may still fail on Streamlit Cloud because YouTube may reject datacenter/cloud IP addresses. In that case, running the app locally with fresh cookies from the same browser session is the reliable path.
