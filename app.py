@@ -294,10 +294,23 @@ def run_command(command: list[str]) -> None:
 # container. Subsequent calls hit the @st.cache_resource cache instantly.
 # ---------------------------------------------------------------------------
 
-# Anonymous visitor cookies from an incognito YouTube session (no account).
-# Used as a secondary signal alongside PO Tokens, and as a fallback if the
-# POT provider setup fails. Expire ~2027 — harmless to refresh when needed.
-_BUILTIN_COOKIES = """# Netscape HTTP Cookie File
+# ---------------------------------------------------------------------------
+# Cookie strategy — two layers, applied in priority order:
+#
+# 1. ACCOUNT COOKIES (Streamlit secret: YOUTUBE_COOKIES_TXT)
+#    Export from a LOGGED-IN YouTube session using the "Get cookies.txt
+#    LOCALLY" Chrome extension. Required for age-restricted, members-only,
+#    or any video that shows "Please sign in". Paste the full file contents
+#    into Streamlit Cloud → Settings → Secrets as:
+#      YOUTUBE_COOKIES_TXT = """..."""
+#
+# 2. ANONYMOUS COOKIES (baked in)
+#    Exported from an incognito YouTube session. No account data. Used as
+#    a browser-legitimacy signal for public videos when no account secret
+#    is configured. Expires ~2027.
+# ---------------------------------------------------------------------------
+
+_ANON_COOKIES = """# Netscape HTTP Cookie File
 # https://curl.haxx.se/rfc/cookie_spec.html
 # This is a generated file! Do not edit.
 
@@ -312,11 +325,22 @@ _BUILTIN_COOKIES = """# Netscape HTTP Cookie File
 
 
 def _write_cookies_to_tempfile() -> str:
-    """Write built-in cookies to a temp file and return its path."""
+    """
+    Write the best available cookies to a temp file and return its path.
+    Prefers account cookies from Streamlit secrets; falls back to anonymous.
+    """
+    # Try account cookies from Streamlit secrets first.
+    try:
+        account_cookies = st.secrets.get("YOUTUBE_COOKIES_TXT", "").strip()
+    except Exception:
+        account_cookies = ""
+
+    cookie_text = account_cookies if account_cookies else _ANON_COOKIES
+
     tmp = tempfile.NamedTemporaryFile(
         delete=False, suffix=".txt", prefix="yt_cookies_", mode="w"
     )
-    tmp.write(_BUILTIN_COOKIES)
+    tmp.write(cookie_text)
     tmp.flush()
     tmp.close()
     return tmp.name
@@ -732,11 +756,28 @@ if submitted:
             error_text = str(e)
             st.error("The export could not be created.")
 
-            if "403" in error_text or "Forbidden" in error_text or "rejected the download request" in error_text:
+            sign_in_error = "sign in" in error_text.lower() or "please sign" in error_text.lower()
+            forbidden_error = "403" in error_text or "Forbidden" in error_text or "rejected the download request" in error_text
+            drm_error = "DRM" in error_text or "drm" in error_text.lower()
+
+            if sign_in_error:
+                st.warning(
+                    "This video requires a signed-in YouTube account to download. "
+                    "To fix this: export cookies from a **logged-in** YouTube session using the "
+                    "[Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) "
+                    "Chrome extension, then add them to Streamlit Cloud under **Settings → Secrets** as "
+                    "`YOUTUBE_COOKIES_TXT` under Settings → Secrets."
+                )
+            elif drm_error:
+                st.warning(
+                    "This video is DRM-protected and cannot be downloaded by any tool. "
+                    "DRM is a hard technical barrier that cannot be bypassed."
+                )
+            elif forbidden_error:
                 st.info(
-                    "This usually means the video host blocked the cloud-server request. "
-                    "Try a different public link, a shorter clip, or run the app locally from your own computer. "
-                    "The app does not bypass DRM, paywalls, login-only videos, or private/restricted content."
+                    "The video host blocked the download request from this cloud server. "
+                    "Try adding account cookies via Streamlit Secrets (see above), "
+                    "or run the app locally on your own computer where IP blocks don't apply."
                 )
 
             with st.expander("Technical details"):
