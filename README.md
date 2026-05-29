@@ -69,24 +69,25 @@ ffmpeg
 
 Streamlit Cloud uses this to install FFmpeg as a system dependency.
 
+## 403 / Forbidden fix notes
+
+This version includes extra reliability improvements for public cloud hosting:
+
+- Adds `nodejs` in `packages.txt` so yt-dlp has a JavaScript runtime available for modern YouTube extraction.
+- Keeps `ffmpeg` in `packages.txt`.
+- Uses yt-dlp retry settings.
+- Tries multiple normal yt-dlp YouTube client profiles.
+- Falls back to safer combined MP4 formats when separate video/audio streams are blocked.
+- Shows a user-friendly message if the host blocks the cloud-server request.
+
+A 403 can still happen on some links because hosts may block Streamlit Cloud/server IPs, require login/cookies, restrict a video, or require validation that public apps should not bypass.
+
 ## Default dark mode
 
-This version includes a Streamlit theme config so the app opens in dark mode by default.
-
-The dark mode config lives here:
+This version includes:
 
 ```text
 .streamlit/config.toml
 ```
 
-Theme settings:
-
-```toml
-[theme]
-base = "dark"
-primaryColor = "#8B5CF6"
-backgroundColor = "#0F172A"
-secondaryBackgroundColor = "#1E293B"
-textColor = "#F8FAFC"
-font = "sans serif"
-```
+with Streamlit dark mode enabled by default.

@@ -282,6 +282,49 @@ def run_command(command: list[str]) -> None:
         raise RuntimeError(details)
 
 
+def get_yt_dlp_attempts(output_type: str, max_height: int) -> list[dict]:
+    """
+    Build multiple yt-dlp attempts.
+
+    Why:
+    Some hosts, especially YouTube, may reject one client profile or one format URL
+    with HTTP 403 even when another format/client works. These attempts do not bypass
+    DRM, paywalls, logins, or private content. They simply let yt-dlp try normal
+    public client profiles and safer format fallbacks.
+    """
+    if output_type == "video":
+        format_attempts = [
+            f"bv*[height<={max_height}]+ba/b[height<={max_height}]/best",
+            f"b[height<={max_height}][ext=mp4]/best[height<={max_height}][ext=mp4]/best",
+            "best[ext=mp4]/best",
+        ]
+    else:
+        format_attempts = [
+            "bestaudio[ext=m4a]/bestaudio/best",
+            "best[ext=m4a]/best",
+        ]
+
+    client_attempts = [
+        {},
+        {"extractor_args": {"youtube": {"player_client": ["default"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["mweb"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["android"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["android_vr"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["tv"]}}},
+    ]
+
+    attempts = []
+    for format_selector in format_attempts:
+        for client_options in client_attempts:
+            attempt = {
+                "format": format_selector,
+                **client_options,
+            }
+            attempts.append(attempt)
+
+    return attempts
+
+
 def download_source_media(
     url: str,
     temp_dir: str,
@@ -292,36 +335,63 @@ def download_source_media(
 ) -> tuple[dict, Path]:
     """
     Use yt-dlp to download the best available source.
-    The final export is then encoded separately for consistent editor-friendly codecs.
+    Then FFmpeg exports it into Premiere-friendly H.264/AAC MP4 or AAC M4A.
+
+    This version retries with multiple safe yt-dlp profiles to reduce HTTP 403
+    errors from public cloud hosting environments.
     """
-    if output_type == "video":
-        format_selector = (
-            f"bv*[height<={max_height}]+ba/"
-            f"b[height<={max_height}]/"
-            f"best"
-        )
-    else:
-        format_selector = "bestaudio/best"
+    last_error: Exception | None = None
+    attempts = get_yt_dlp_attempts(output_type, max_height)
 
-    options = {
-        "format": format_selector,
-        "outtmpl": os.path.join(temp_dir, "source.%(ext)s"),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "progress_hooks": [progress_hook],
-        "ffmpeg_location": converter_path,
-        "merge_output_format": "mkv" if output_type == "video" else None,
-    }
+    for attempt_number, attempt in enumerate(attempts, start=1):
+        attempt_dir = Path(temp_dir) / f"attempt_{attempt_number}"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
 
-    # Remove None values to avoid passing unnecessary config.
-    options = {key: value for key, value in options.items() if value is not None}
+        options = {
+            "outtmpl": os.path.join(str(attempt_dir), "source.%(ext)s"),
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "progress_hooks": [progress_hook],
+            "ffmpeg_location": converter_path,
+            "merge_output_format": "mkv" if output_type == "video" else None,
+            "retries": 5,
+            "fragment_retries": 5,
+            "file_access_retries": 3,
+            "extractor_retries": 3,
+            "socket_timeout": 30,
+            "http_headers": {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            **attempt,
+        }
 
-    with YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=True)
+        # Remove None values to avoid passing unnecessary config.
+        options = {key: value for key, value in options.items() if value is not None}
 
-    source_file = find_newest_media_file(temp_dir)
-    return info, source_file
+        try:
+            with YoutubeDL(options) as ydl:
+                info = ydl.extract_info(url, download=True)
+
+            source_file = find_newest_media_file(str(attempt_dir))
+            return info, source_file
+
+        except Exception as e:
+            last_error = e
+            shutil.rmtree(attempt_dir, ignore_errors=True)
+            continue
+
+    raise RuntimeError(
+        "The site rejected the download request after multiple attempts. "
+        "This often happens when the video host blocks cloud-server downloads, "
+        "requires login/cookies, requires extra client validation, or restricts that video. "
+        f"Last error: {last_error}"
+    )
 
 
 def export_premiere_mp4(source_file: Path, output_file: Path, converter_path: str, crf: int) -> None:
@@ -562,9 +632,18 @@ if submitted:
             )
 
         except Exception as e:
+            error_text = str(e)
             st.error("The export could not be created.")
+
+            if "403" in error_text or "Forbidden" in error_text or "rejected the download request" in error_text:
+                st.info(
+                    "This usually means the video host blocked the cloud-server request. "
+                    "Try a different public link, a shorter clip, or run the app locally from your own computer. "
+                    "The app does not bypass DRM, paywalls, login-only videos, or private/restricted content."
+                )
+
             with st.expander("Technical details"):
-                st.code(str(e), language="text")
+                st.code(error_text, language="text")
 
 
 st.markdown(
