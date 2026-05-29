@@ -1,20 +1,29 @@
-# yt-dlp + FFmpeg Streamlit MP4 / MP3 Converter
+# Carlos Knight Media Converter
 
-This Streamlit app uses:
+A professional Streamlit app powered by `yt-dlp` and FFmpeg.
 
-- `yt-dlp` to download media
-- `FFmpeg` to merge MP4 video/audio streams
-- `FFmpeg` to extract and convert audio to MP3
+## User-facing exports
 
-## Important
+The app gives users two clean export choices:
 
-Use this only for media you own, have permission to download, or that the copyright owner/site clearly allows you to download. This app does not bypass DRM, paywalls, logins, or platform restrictions.
+1. **MP4 video for Premiere Pro**
+   - Container: `.mp4`
+   - Video codec: H.264
+   - Audio codec: AAC
+   - Pixel format: yuv420p
+   - Fast-start enabled
+
+2. **Audio export for Premiere Pro**
+   - Container: `.m4a`
+   - Audio codec: AAC
+
+This is more Premiere Pro friendly than generic video/audio downloads.
 
 ## Files
 
-- `app.py` - Main Streamlit app
-- `requirements.txt` - Python dependencies
-- `packages.txt` - System dependency for Streamlit Cloud
+- `app.py`
+- `requirements.txt`
+- `packages.txt`
 
 ## Run locally
 
@@ -23,7 +32,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-You need FFmpeg installed on your computer.
+You also need FFmpeg installed locally.
 
 ### macOS
 
@@ -42,9 +51,9 @@ sudo apt update
 sudo apt install ffmpeg
 ```
 
-## Deploy to Streamlit Cloud
+## Streamlit Cloud deployment
 
-Add these files to your GitHub repo:
+Upload these files to GitHub:
 
 ```text
 app.py
@@ -52,27 +61,10 @@ requirements.txt
 packages.txt
 ```
 
-The `packages.txt` file contains:
+The `packages.txt` file must contain:
 
 ```text
 ffmpeg
 ```
 
-Streamlit Cloud uses this file to install FFmpeg as a system package.
-
-## What changed in this version?
-
-This version explicitly uses FFmpeg by:
-
-1. Detecting FFmpeg with `shutil.which("ffmpeg")`
-2. Showing the FFmpeg path/version in the sidebar
-3. Blocking conversion if FFmpeg is missing
-4. Passing the FFmpeg path into yt-dlp with:
-
-```python
-"ffmpeg_location": ffmpeg_path
-```
-
-5. Using FFmpeg postprocessors for:
-   - MP3 extraction
-   - MP4 remuxing/merging
+Streamlit Cloud uses this to install FFmpeg as a system dependency.
