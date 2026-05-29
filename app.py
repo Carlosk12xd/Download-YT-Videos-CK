@@ -570,8 +570,7 @@ if submitted:
 st.markdown(
     """
     <div class="footer-note">
-        Use this only for media you own, have permission to download, or that is clearly allowed by the site and copyright owner.
-        This app does not bypass DRM, paywalls, logins, or platform restrictions.
+        Hola Vision Latina :). 
     </div>
     """,
     unsafe_allow_html=True,
