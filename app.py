@@ -291,26 +291,29 @@ def get_yt_dlp_attempts(output_type: str, max_height: int) -> list[dict]:
     with HTTP 403 even when another format/client works. These attempts do not bypass
     DRM, paywalls, logins, or private content. They simply let yt-dlp try normal
     public client profiles and safer format fallbacks.
+
+    The po_token + visitor_data (obtained via cookies) is the most reliable fix
+    for 403s on YouTube from cloud servers as of 2024–2025.
     """
     if output_type == "video":
         format_attempts = [
-            f"bv*[height<={max_height}]+ba/b[height<={max_height}]/best",
-            f"b[height<={max_height}][ext=mp4]/best[height<={max_height}][ext=mp4]/best",
-            "best[ext=mp4]/best",
+            # Prefer a single combined mp4 stream — avoids the DASH 403 that
+            # separate video+audio streams often trigger on cloud IPs.
+            f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]/best[ext=mp4]/best",
+            f"b[height<={max_height}]/best",
         ]
     else:
         format_attempts = [
-            "bestaudio[ext=m4a]/bestaudio/best",
-            "best[ext=m4a]/best",
+            "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
         ]
 
+    # Most reliable clients for authenticated/cloud requests, ordered by success rate.
     client_attempts = [
-        {},
-        {"extractor_args": {"youtube": {"player_client": ["default"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["web"]}}},
         {"extractor_args": {"youtube": {"player_client": ["mweb"]}}},
         {"extractor_args": {"youtube": {"player_client": ["android"]}}},
-        {"extractor_args": {"youtube": {"player_client": ["android_vr"]}}},
-        {"extractor_args": {"youtube": {"player_client": ["tv"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["tv_embedded"]}}},
+        {},  # yt-dlp default as final fallback
     ]
 
     attempts = []
@@ -332,13 +335,15 @@ def download_source_media(
     max_height: int,
     progress_hook,
     converter_path: str,
+    cookies_file: str | None = None,
 ) -> tuple[dict, Path]:
     """
     Use yt-dlp to download the best available source.
     Then FFmpeg exports it into Premiere-friendly H.264/AAC MP4 or AAC M4A.
 
-    This version retries with multiple safe yt-dlp profiles to reduce HTTP 403
-    errors from public cloud hosting environments.
+    cookies_file: path to a Netscape-format cookies.txt exported from your browser.
+    Providing cookies from a logged-in YouTube session is the most reliable fix
+    for HTTP 403 errors when running on a cloud server.
     """
     last_error: Exception | None = None
     attempts = get_yt_dlp_attempts(output_type, max_height)
@@ -368,6 +373,7 @@ def download_source_media(
                 ),
                 "Accept-Language": "en-US,en;q=0.9",
             },
+            "cookiefile": cookies_file,
             **attempt,
         }
 
@@ -464,6 +470,7 @@ def convert_url(
     quality_label: str,
     audio_bitrate: str,
     converter_path: str,
+    cookies_file: str | None = None,
 ):
     temp_dir = tempfile.mkdtemp(prefix="carlos_converter_")
 
@@ -502,6 +509,7 @@ def convert_url(
             max_height=max_height,
             progress_hook=progress_hook,
             converter_path=converter_path,
+            cookies_file=cookies_file,
         )
 
         title = info.get("title", "export") if isinstance(info, dict) else "export"
@@ -589,6 +597,20 @@ with st.form("converter_form"):
         disabled=output_choice.startswith("MP4"),
     )
 
+    with st.expander("🍪 YouTube cookies (fixes 403 errors on cloud)"):
+        st.markdown(
+            "If you see **403 Forbidden** errors, upload a `cookies.txt` from your "
+            "logged-in YouTube session. This lets the app download as you.\n\n"
+            "**How to export cookies:** Install the "
+            "[Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) "
+            "Chrome extension, go to youtube.com while logged in, click the extension, and export."
+        )
+        cookies_upload = st.file_uploader(
+            "Upload cookies.txt (optional)",
+            type=["txt"],
+            help="Netscape-format cookies file exported from your browser.",
+        )
+
     submitted = st.form_submit_button("Create Export")
 
 st.markdown("</div>", unsafe_allow_html=True)
@@ -606,6 +628,17 @@ if submitted:
 
     else:
         try:
+            # Save uploaded cookies to a temp file if provided
+            cookies_path: str | None = None
+            if cookies_upload is not None:
+                cookies_tmp = tempfile.NamedTemporaryFile(
+                    delete=False, suffix=".txt", prefix="yt_cookies_"
+                )
+                cookies_tmp.write(cookies_upload.getvalue())
+                cookies_tmp.flush()
+                cookies_tmp.close()
+                cookies_path = cookies_tmp.name
+
             with st.spinner("Creating your editor-friendly file..."):
                 result = convert_url(
                     url=url.strip(),
@@ -614,7 +647,14 @@ if submitted:
                     quality_label=quality_label,
                     audio_bitrate=audio_bitrate,
                     converter_path=converter_path,
+                    cookies_file=cookies_path,
                 )
+
+            if cookies_path:
+                try:
+                    os.unlink(cookies_path)
+                except OSError:
+                    pass
 
             st.download_button(
                 label=f"{result['label']} ({result['size']})",
