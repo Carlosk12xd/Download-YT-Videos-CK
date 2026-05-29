@@ -91,3 +91,17 @@ This version includes:
 ```
 
 with Streamlit dark mode enabled by default.
+
+
+## Sign-in / 403 fix
+
+This version does **not** label every YouTube failure as DRM. It separates:
+
+- real DRM messages
+- YouTube sign-in / bot-check messages
+- cloud-server 403 blocks
+- format availability errors
+
+For videos you own or have permission to access, the app includes an **Advanced: YouTube sign-in fix** section where a user can upload a `cookies.txt` file for the current conversion. The cookies file is written to a temporary file, used by yt-dlp, then deleted.
+
+The bgutil PO-token provider path was also fixed so `server_home` points to the required `~/bgutil-ytdlp-pot-provider/server` directory.

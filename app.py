@@ -324,18 +324,43 @@ _ANON_COOKIES = """# Netscape HTTP Cookie File
 """
 
 
-def _write_cookies_to_tempfile() -> str:
+def _normalize_cookie_text(cookie_text: str) -> str:
     """
-    Write the best available cookies to a temp file and return its path.
-    Prefers account cookies from Streamlit secrets; falls back to anonymous.
+    Make sure cookies.txt content has a Netscape cookie header.
+    yt-dlp expects the standard cookies.txt format.
     """
-    # Try account cookies from Streamlit secrets first.
-    try:
-        account_cookies = st.secrets.get("YOUTUBE_COOKIES_TXT", "").strip()
-    except Exception:
-        account_cookies = ""
+    cookie_text = (cookie_text or "").strip()
+    if not cookie_text:
+        return ""
 
-    cookie_text = account_cookies if account_cookies else _ANON_COOKIES
+    if "# Netscape HTTP Cookie File" not in cookie_text.splitlines()[:5]:
+        cookie_text = "# Netscape HTTP Cookie File\n" + cookie_text
+
+    return cookie_text + "\n"
+
+
+def _write_cookies_to_tempfile(cookie_text_override: str | None = None) -> str | None:
+    """
+    Write cookies to a temp file and return its path.
+
+    Priority:
+    1. Cookies uploaded by the current user for this one conversion.
+    2. Cookies stored in Streamlit Secrets as YOUTUBE_COOKIES_TXT.
+    3. No cookies.
+
+    Important: this does not bypass DRM. It only lets yt-dlp make a normal
+    signed-in request when YouTube asks for sign-in or flags cloud traffic.
+    """
+    cookie_text = _normalize_cookie_text(cookie_text_override or "")
+
+    if not cookie_text:
+        try:
+            cookie_text = _normalize_cookie_text(st.secrets.get("YOUTUBE_COOKIES_TXT", ""))
+        except Exception:
+            cookie_text = ""
+
+    if not cookie_text:
+        return None
 
     tmp = tempfile.NamedTemporaryFile(
         delete=False, suffix=".txt", prefix="yt_cookies_", mode="w"
@@ -446,12 +471,96 @@ def _build_attempts(output_type: str, max_height: int) -> list[dict]:
 
 
 def _bgutil_server_home() -> str | None:
-    """Return the bgutil server home path if the compiled scripts exist."""
-    path = Path.home() / "bgutil-ytdlp-pot-provider"
-    if (path / "server" / "build" / "generate_once.js").exists():
-        return str(path)
+    """
+    Return the bgutil script provider server directory.
+
+    bgutil docs require server_home to point to:
+    ~/bgutil-ytdlp-pot-provider/server
+    not the repository root.
+    """
+    server_dir = Path.home() / "bgutil-ytdlp-pot-provider" / "server"
+    if (server_dir / "build" / "generate_once.js").exists():
+        return str(server_dir)
     return None
 
+
+
+
+class QuietYTDLPLogger:
+    """
+    Keep Streamlit Cloud logs cleaner. yt-dlp errors are still captured and
+    shown inside the app's Technical details expander.
+    """
+    def debug(self, msg):
+        pass
+
+    def warning(self, msg):
+        pass
+
+    def error(self, msg):
+        pass
+
+
+def classify_download_error(error_text: str) -> str:
+    """
+    Classify yt-dlp errors without falsely calling normal YouTube cloud blocks DRM.
+    """
+    text = (error_text or "").lower()
+
+    if "drm protected" in text or "this video is drm" in text:
+        return "drm"
+
+    if (
+        "please sign in" in text
+        or "sign in to confirm" in text
+        or "use --cookies-from-browser" in text
+        or "use --cookies" in text
+        or "login required" in text
+        or "private video" in text
+        or "members-only" in text
+    ):
+        return "signin"
+
+    if "http error 403" in text or "forbidden" in text:
+        return "forbidden"
+
+    if "requested format is not available" in text:
+        return "format"
+
+    return "other"
+
+
+def friendly_download_error(error_text: str) -> str:
+    kind = classify_download_error(error_text)
+
+    if kind == "drm":
+        return (
+            "This video is reported as DRM-protected by the video host, so this app cannot download it."
+        )
+
+    if kind == "signin":
+        return (
+            "YouTube is asking for a signed-in browser session. This does not always mean the video is DRM. "
+            "On Streamlit Cloud, YouTube often blocks server traffic unless you provide a cookies.txt file "
+            "from a YouTube account that is allowed to view the video."
+        )
+
+    if kind == "forbidden":
+        return (
+            "YouTube blocked the download request from this cloud server with a 403 error. "
+            "Try uploading a cookies.txt file in the Advanced section, or run the app locally from your own computer."
+        )
+
+    if kind == "format":
+        return (
+            "YouTube did not expose the requested format to this server. The app tried fallback formats, "
+            "but this often happens together with sign-in or cloud-server blocking."
+        )
+
+    return (
+        "The export could not be created for this link. Try a public video, upload cookies.txt in Advanced, "
+        "or run the app locally."
+    )
 
 def download_source_media(
     url: str,
@@ -460,13 +569,14 @@ def download_source_media(
     max_height: int,
     progress_hook,
     converter_path: str,
+    cookie_text_override: str | None = None,
 ) -> tuple[dict, Path]:
     """
     Download the raw source with yt-dlp, then FFmpeg re-encodes everything.
     PO Tokens are provided automatically by the bgutil plugin (if set up).
     Anonymous cookies are always sent as a supplementary signal.
     """
-    cookies_file = _write_cookies_to_tempfile()
+    cookies_file = _write_cookies_to_tempfile(cookie_text_override)
     last_error: Exception | None = None
     attempts = _build_attempts(output_type, max_height)
 
@@ -515,8 +625,12 @@ def download_source_media(
                     ),
                     "Accept-Language": "en-US,en;q=0.9",
                 },
+                "logger": QuietYTDLPLogger(),
                 **attempt_without_ea,
             }
+
+            # Remove empty values so yt-dlp does not receive cookiefile=None.
+            options = {key: value for key, value in options.items() if value is not None}
 
             try:
                 with YoutubeDL(options) as ydl:
@@ -530,18 +644,15 @@ def download_source_media(
                 shutil.rmtree(attempt_dir, ignore_errors=True)
                 continue
 
-        raise RuntimeError(
-            "Could not download the video after multiple attempts. "
-            "Common causes: the video host blocks cloud-server IPs, the video requires "
-            "a login, is private/restricted, or is DRM-protected. "
-            f"Last error: {last_error}"
-        )
+        last_error_text = str(last_error)
+        raise RuntimeError(friendly_download_error(last_error_text) + f"\n\nLast yt-dlp error: {last_error_text}")
     finally:
         # Always delete the temp cookies file immediately after use.
-        try:
-            os.unlink(cookies_file)
-        except OSError:
-            pass
+        if cookies_file:
+            try:
+                os.unlink(cookies_file)
+            except OSError:
+                pass
 
 
 def export_premiere_mp4(source_file: Path, output_file: Path, converter_path: str, crf: int) -> None:
@@ -614,6 +725,7 @@ def convert_url(
     quality_label: str,
     audio_bitrate: str,
     converter_path: str,
+    cookie_text_override: str | None = None,
 ):
     temp_dir = tempfile.mkdtemp(prefix="carlos_converter_")
 
@@ -652,6 +764,7 @@ def convert_url(
             max_height=max_height,
             progress_hook=progress_hook,
             converter_path=converter_path,
+            cookie_text_override=cookie_text_override,
         )
 
         title = info.get("title", "export") if isinstance(info, dict) else "export"
@@ -743,6 +856,18 @@ with st.form("converter_form"):
         disabled=output_choice.startswith("MP4"),
     )
 
+    with st.expander("Advanced: YouTube sign-in fix"):
+        st.caption(
+            "Only use this for videos you own or have permission to access. "
+            "If YouTube blocks Streamlit Cloud with a sign-in or 403 error, upload a cookies.txt file "
+            "exported from a browser session that can view the video. The file is used only for this conversion."
+        )
+        uploaded_cookies = st.file_uploader(
+            "Optional cookies.txt file",
+            type=["txt"],
+            accept_multiple_files=False,
+        )
+
     submitted = st.form_submit_button("Create Export")
 
 st.markdown("</div>", unsafe_allow_html=True)
@@ -761,6 +886,10 @@ if submitted:
     else:
         try:
             with st.spinner("Creating your editor-friendly file..."):
+                cookie_text_override = None
+                if uploaded_cookies is not None:
+                    cookie_text_override = uploaded_cookies.getvalue().decode("utf-8", errors="ignore")
+
                 result = convert_url(
                     url=url.strip(),
                     output_choice=output_choice,
@@ -768,6 +897,7 @@ if submitted:
                     quality_label=quality_label,
                     audio_bitrate=audio_bitrate,
                     converter_path=converter_path,
+                    cookie_text_override=cookie_text_override,
                 )
 
             st.download_button(
@@ -789,28 +919,17 @@ if submitted:
             error_text = str(e)
             st.error("The export could not be created.")
 
-            sign_in_error = "sign in" in error_text.lower() or "please sign" in error_text.lower()
-            forbidden_error = "403" in error_text or "Forbidden" in error_text or "rejected the download request" in error_text
-            drm_error = "DRM" in error_text or "drm" in error_text.lower()
+            error_kind = classify_download_error(error_text)
+            st.info(friendly_download_error(error_text))
 
-            if sign_in_error:
+            if error_kind in {"signin", "forbidden", "format"}:
                 st.warning(
-                    "This video requires a signed-in YouTube account to download. "
-                    "To fix this: export cookies from a **logged-in** YouTube session using the "
-                    "[Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) "
-                    "Chrome extension, then add them to Streamlit Cloud under **Settings → Secrets** as "
-                    "`YOUTUBE_COOKIES_TXT` under Settings → Secrets."
+                    "This is usually a YouTube cloud-server/authentication block, not proof that your video is DRM. "
+                    "Open Advanced, upload a valid cookies.txt file from a browser that can play the video, then try again."
                 )
-            elif drm_error:
+            elif error_kind == "drm":
                 st.warning(
-                    "This video is DRM-protected and cannot be downloaded by any tool. "
-                    "DRM is a hard technical barrier that cannot be bypassed."
-                )
-            elif forbidden_error:
-                st.info(
-                    "The video host blocked the download request from this cloud server. "
-                    "Try adding account cookies via Streamlit Secrets (see above), "
-                    "or run the app locally on your own computer where IP blocks don't apply."
+                    "The video host reported DRM. This app will not attempt to bypass DRM."
                 )
 
             with st.expander("Technical details"):
