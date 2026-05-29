@@ -1,13 +1,13 @@
 import os
 import re
+import sys
 import shutil
 import subprocess
 import tempfile
+import platform
 from pathlib import Path
 
 import streamlit as st
-from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadError
 
 
 st.set_page_config(
@@ -20,22 +20,17 @@ st.set_page_config(
 
 CUSTOM_CSS = """
 <style>
-:root {
-    --card-bg: rgba(255, 255, 255, 0.10);
-    --card-border: rgba(255, 255, 255, 0.18);
-}
-
 .stApp {
     background:
-        radial-gradient(circle at 10% 20%, rgba(255, 90, 120, 0.28), transparent 28%),
-        radial-gradient(circle at 90% 10%, rgba(96, 165, 250, 0.30), transparent 30%),
-        radial-gradient(circle at 50% 90%, rgba(168, 85, 247, 0.26), transparent 28%),
+        radial-gradient(circle at 10% 20%, rgba(255, 90, 120, 0.25), transparent 28%),
+        radial-gradient(circle at 90% 10%, rgba(96, 165, 250, 0.28), transparent 30%),
+        radial-gradient(circle at 50% 90%, rgba(168, 85, 247, 0.24), transparent 28%),
         linear-gradient(135deg, #0f172a 0%, #111827 45%, #020617 100%);
     color: #f8fafc;
 }
 
 .block-container {
-    max-width: 900px;
+    max-width: 930px;
     padding-top: 3rem;
     padding-bottom: 3rem;
 }
@@ -132,12 +127,32 @@ CUSTOM_CSS = """
     font-size: 0.9rem;
 }
 
+.local-note {
+    margin: 1rem 0 1.3rem 0;
+    padding: 1rem 1.1rem;
+    border-radius: 18px;
+    background: rgba(34, 197, 94, 0.12);
+    border: 1px solid rgba(74, 222, 128, 0.22);
+    color: #dcfce7;
+    font-size: 0.95rem;
+}
+
+.cloud-note {
+    margin: 1rem 0 1.3rem 0;
+    padding: 1rem 1.1rem;
+    border-radius: 18px;
+    background: rgba(245, 158, 11, 0.12);
+    border: 1px solid rgba(251, 191, 36, 0.25);
+    color: #fef3c7;
+    font-size: 0.95rem;
+}
+
 div[data-testid="stForm"] {
     border: 0;
     padding: 0;
 }
 
-label, .stRadio label, .stSelectbox label, .stTextInput label {
+label, .stRadio label, .stSelectbox label, .stTextInput label, .stCheckbox label {
     color: #e5e7eb !important;
     font-weight: 700 !important;
 }
@@ -153,10 +168,6 @@ label, .stRadio label, .stSelectbox label, .stTextInput label {
     background: rgba(255,255,255,0.94) !important;
     color: #0f172a !important;
     border-radius: 14px !important;
-}
-
-.stRadio [role="radiogroup"] {
-    gap: 0.6rem;
 }
 
 .stButton > button,
@@ -186,20 +197,18 @@ button[kind="primaryFormSubmit"] {
 </style>
 """
 
-
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 st.markdown(
     """
     <div class="hero-card">
-        <div class="brand-kicker">🎞️ Premiere-friendly exports</div>
+        <div class="brand-kicker">🎞️ Stacher-style yt-dlp interface</div>
         <h1 class="hero-title">
             Media Converter<br>
             <span class="gradient-text">MP4 + Audio Export</span>
         </h1>
         <p class="hero-subtitle">
-            Paste a media link, choose your export type, and download a clean file
-            designed to import smoothly into editing apps like Adobe Premiere Pro.
+            Paste a link, choose your export, and download a clean file designed to import smoothly into editing apps like Adobe Premiere Pro.
         </p>
         <div class="credit">By Carlos Knight</div>
     </div>
@@ -214,8 +223,8 @@ st.markdown(
             M4A file with AAC audio.
         </div>
         <div class="feature-card">
-            <strong>Editor Ready</strong>
-            Fast-start files for smoother importing.
+            <strong>Local Friendly</strong>
+            Can use your own browser session.
         </div>
     </div>
     """,
@@ -223,25 +232,25 @@ st.markdown(
 )
 
 
-def find_converter_engine() -> str | None:
+def is_streamlit_cloud() -> bool:
     """
-    Find the local conversion engine.
-    Kept out of the regular UI so non-technical users are not overwhelmed.
+    Best-effort Streamlit Cloud detection.
+    Cloud paths typically run under /mount/src and cannot access a user's browser cookies.
     """
-    return shutil.which("ffmpeg")
+    cwd = str(Path.cwd())
+    return cwd.startswith("/mount/src") or os.getenv("STREAMLIT_RUNTIME_ENV") == "cloud"
 
 
-def human_bytes(num: int | float | None) -> str:
-    if not num:
-        return "0 B"
+def find_exe(name: str) -> str | None:
+    return shutil.which(name)
 
-    num = float(num)
-    for unit in ["B", "KB", "MB", "GB"]:
-        if num < 1024:
-            return f"{num:.1f} {unit}"
-        num /= 1024
 
-    return f"{num:.1f} TB"
+def default_download_dir() -> str:
+    home = Path.home()
+    downloads = home / "Downloads"
+    if downloads.exists():
+        return str(downloads)
+    return str(home)
 
 
 def safe_filename(name: str, fallback: str = "export") -> str:
@@ -250,123 +259,76 @@ def safe_filename(name: str, fallback: str = "export") -> str:
     return cleaned[:90] or fallback
 
 
-def find_newest_media_file(download_dir: str, exclude_names: set[str] | None = None) -> Path:
-    exclude_names = exclude_names or set()
-    directory = Path(download_dir)
+def human_bytes(num: int | float | None) -> str:
+    if not num:
+        return "0 B"
+    num = float(num)
+    for unit in ["B", "KB", "MB", "GB"]:
+        if num < 1024:
+            return f"{num:.1f} {unit}"
+        num /= 1024
+    return f"{num:.1f} TB"
 
+
+def newest_file(folder: str | Path, preferred_ext: str | None = None) -> Path:
+    folder = Path(folder)
     files = [
-        p for p in directory.iterdir()
+        p for p in folder.iterdir()
         if p.is_file()
-        and p.name not in exclude_names
         and not p.name.endswith(".part")
         and not p.name.endswith(".ytdl")
         and not p.name.endswith(".temp")
     ]
-
+    if preferred_ext:
+        preferred = [p for p in files if p.suffix.lower() == f".{preferred_ext.lower()}"]
+        if preferred:
+            files = preferred
     if not files:
-        raise FileNotFoundError("No downloaded media file was created.")
-
+        raise FileNotFoundError("No output file was created.")
     return max(files, key=lambda p: p.stat().st_mtime)
 
 
-def run_command(command: list[str]) -> None:
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    if result.returncode != 0:
-        details = result.stderr.strip() or result.stdout.strip() or "Unknown conversion error."
-        raise RuntimeError(details)
-
-
-# ---------------------------------------------------------------------------
-# PO Token (Proof-of-Origin) provider setup
-# ---------------------------------------------------------------------------
-# bgutil-ytdlp-pot-provider clones a small Node.js script at first startup,
-# then generates fresh PO Tokens on every yt-dlp call. PO Tokens prove the
-# request came from a real browser — no account, no cookies, no expiry.
-#
-# Node.js is installed via packages.txt. The one-time npm install + TypeScript
-# compile runs automatically when the app starts for the first time on a new
-# container. Subsequent calls hit the @st.cache_resource cache instantly.
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Cookie strategy
-# ---------------------------------------------------------------------------
-# Public Streamlit Cloud IPs often trigger YouTube's sign-in / bot checks.
-# The reliable fix is to let the user supply their own cookies.txt for a
-# browser session that can play the video. The app writes those cookies to a
-# temporary file only for the current conversion, then deletes it.
-#
-# This is meant only for videos the user owns, has permission to use, or can
-# legitimately access in their own browser. It does not bypass DRM, paywalls,
-# private videos, or platform restrictions.
-# ---------------------------------------------------------------------------
-
-
-def _read_uploaded_cookies(uploaded_file) -> str:
-    """
-    Read a Streamlit uploaded cookies.txt file into text.
-    Returns an empty string if nothing valid was uploaded.
-    """
+def read_uploaded_cookies(uploaded_file) -> str:
     if uploaded_file is None:
         return ""
-
     try:
-        raw = uploaded_file.getvalue()
-        text = raw.decode("utf-8", errors="ignore").strip()
-        return text
+        return uploaded_file.getvalue().decode("utf-8", errors="ignore").strip()
     except Exception:
         return ""
 
 
-def _validate_cookies_text(cookie_text: str) -> bool:
+def read_secret_cookies() -> str:
     """
-    Light validation for Netscape cookies.txt format.
-    We intentionally do not parse or expose cookie values.
+    Read YouTube cookies from Streamlit Secrets.
+
+    In Streamlit Cloud, set a secret named YOUTUBE_COOKIES_TXT and paste the
+    full Netscape cookies.txt content as a TOML multiline string.
+
+    Do not commit real cookies to GitHub.
     """
+    try:
+        value = st.secrets.get("YOUTUBE_COOKIES_TXT", "")
+        if value is None:
+            return ""
+        return str(value).strip()
+    except Exception:
+        return ""
+
+
+def secret_cookies_available() -> bool:
+    return valid_cookie_text(read_secret_cookies())
+
+
+
+def valid_cookie_text(cookie_text: str) -> bool:
     if not cookie_text:
         return False
-
-    lowered = cookie_text.lower()
-    has_youtube = "youtube.com" in lowered or ".youtube.com" in lowered
-    has_cookie_header = "netscape http cookie file" in lowered
-    has_tabbed_cookie_rows = any(
-        ("youtube.com" in line.lower() and "\t" in line)
-        for line in cookie_text.splitlines()
-    )
-
-    return has_youtube and (has_cookie_header or has_tabbed_cookie_rows)
+    lower = cookie_text.lower()
+    return ("youtube.com" in lower or ".youtube.com" in lower) and "\t" in cookie_text
 
 
-def _get_secret_cookies() -> str:
-    """
-    Optional: read account cookies from Streamlit Secrets.
-    Useful if you want this app to work only for your own deployment/account.
-    """
-    try:
-        return st.secrets.get("YOUTUBE_COOKIES_TXT", "").strip()
-    except Exception:
-        return ""
-
-
-def _write_cookies_to_tempfile(user_cookie_text: str = "") -> str | None:
-    """
-    Write cookies to a temp file and return the path.
-    Priority:
-      1. cookies.txt uploaded in the Advanced section
-      2. YOUTUBE_COOKIES_TXT in Streamlit Secrets
-      3. no cookies
-    """
-    cookie_text = (user_cookie_text or "").strip()
-    if not cookie_text:
-        cookie_text = _get_secret_cookies()
-
-    if not _validate_cookies_text(cookie_text):
+def write_temp_cookies(cookie_text: str) -> str | None:
+    if not valid_cookie_text(cookie_text):
         return None
 
     tmp = tempfile.NamedTemporaryFile(
@@ -382,281 +344,125 @@ def _write_cookies_to_tempfile(user_cookie_text: str = "") -> str | None:
     return tmp.name
 
 
-@st.cache_resource(show_spinner=False)
-def _setup_pot_provider() -> bool:
+def run_process(command: list[str], progress_bar=None, status_box=None) -> str:
     """
-    Clone bgutil-ytdlp-pot-provider and compile its TypeScript once per
-    container lifetime. Returns True on success, False on failure (the app
-    falls back to cookies-only mode automatically).
-
-    Steps performed on first call:
-      1. git clone Brainicism/bgutil-ytdlp-pot-provider -> ~/bgutil-ytdlp-pot-provider
-      2. npm install  (in server/ subdirectory)
-      3. npx tsc      (compiles TypeScript to build/*)
-    Node.js is provided by packages.txt so npm/npx are always available.
+    Run a subprocess and stream logs into Streamlit.
     """
-    home = Path.home()
-    server_dir = home / "bgutil-ytdlp-pot-provider" / "server"
-    sentinel = server_dir / "build" / "generate_once.js"
+    log_lines: list[str] = []
 
-    if sentinel.exists():
-        return True  # Already built on this container — nothing to do.
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
 
-    try:
-        clone_dir = home / "bgutil-ytdlp-pot-provider"
-        if not clone_dir.exists():
-            subprocess.run(
-                [
-                    "git", "clone", "--depth", "1",
-                    "--branch", "1.3.1",
-                    "https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git",
-                    str(clone_dir),
-                ],
-                check=True,
-                capture_output=True,
-                timeout=120,
-            )
+    percent_re = re.compile(r"(\d{1,3}(?:\.\d+)?)%")
 
-        subprocess.run(
-            ["npm", "ci", "--prefer-offline"],
-            check=True,
-            capture_output=True,
-            cwd=str(server_dir),
-            timeout=240,
-        )
+    if process.stdout:
+        for line in process.stdout:
+            clean = line.rstrip()
+            if clean:
+                log_lines.append(clean)
 
-        subprocess.run(
-            ["npx", "--yes", "tsc"],
-            check=True,
-            capture_output=True,
-            cwd=str(server_dir),
-            timeout=120,
-        )
+            match = percent_re.search(clean)
+            if progress_bar and match:
+                try:
+                    pct = float(match.group(1))
+                    progress_bar.progress(min(max(pct / 100, 0), 0.95), text=clean[:120])
+                except Exception:
+                    pass
 
-        return sentinel.exists()
+            if status_box and clean:
+                status_box.caption(clean[:180])
 
-    except Exception:
-        return False
+    return_code = process.wait()
+    full_log = "\n".join(log_lines)
+
+    if return_code != 0:
+        raise RuntimeError(full_log or f"Command failed with exit code {return_code}")
+
+    return full_log
 
 
-def _build_attempts(output_type: str, max_height: int, using_cookies: bool) -> list[dict]:
-    """
-    Return yt-dlp attempt configs.
-
-    Keep this intentionally conservative:
-    - Avoid client profiles that often create misleading DRM errors.
-    - Prefer simple public formats, then let FFmpeg do the final Premiere export.
-    - If cookies are supplied, try web-style clients first because the browser
-      session is what YouTube asked for.
-    """
-    if output_type == "video":
-        format_selectors = [
-            # Download a playable source first. FFmpeg later exports clean H.264/AAC.
-            f"best[height<={max_height}]/best",
-            f"bv*[height<={max_height}]+ba/b[height<={max_height}]/best",
-            "best",
-        ]
-    else:
-        format_selectors = [
-            "bestaudio[ext=m4a]/bestaudio/best",
-            "best",
-        ]
-
-    if using_cookies:
-        client_profiles = [
-            {"extractor_args": {"youtube": {"player_client": ["web"]}}},
-            {"extractor_args": {"youtube": {"player_client": ["mweb"]}}},
-            {"extractor_args": {"youtube": {"player_client": ["ios"]}}},
-            {"extractor_args": {"youtube": {"player_client": ["android"]}}},
-            {},
-        ]
-    else:
-        client_profiles = [
-            {"extractor_args": {"youtube": {"player_client": ["ios"]}}},
-            {"extractor_args": {"youtube": {"player_client": ["android"]}}},
-            {"extractor_args": {"youtube": {"player_client": ["mweb"]}}},
-            {},
-        ]
-
-    attempts = []
-    for fmt in format_selectors:
-        for client in client_profiles:
-            attempts.append({"format": fmt, **client})
-    return attempts
-
-
-def _summarize_download_failure(errors: list[str], using_cookies: bool) -> str:
-    """
-    Turn many yt-dlp attempt errors into one accurate message.
-    """
-    joined = "\n\n".join(errors[-8:]) if errors else "Unknown yt-dlp error."
-    lower = joined.lower()
-
-    if "please sign in" in lower or "sign in to confirm" in lower:
-        if using_cookies:
-            user_message = (
-                "YouTube still asked for sign-in even though cookies were provided. "
-                "That usually means the cookies.txt file is expired, incomplete, exported from the wrong browser/session, "
-                "or YouTube does not trust the Streamlit Cloud server IP. Export a fresh cookies.txt from a browser that can "
-                "play the video, or run this app locally on your own computer."
-            )
-        else:
-            user_message = (
-                "YouTube is asking this cloud server to sign in. Open Advanced and upload a fresh cookies.txt file "
-                "from a browser session that can play the video, or run the app locally on your own computer."
-            )
-
-    elif "http error 403" in lower or "forbidden" in lower:
-        user_message = (
-            "YouTube blocked the actual media download from this Streamlit Cloud server with a 403 error. "
-            "This is usually a cloud-server/IP trust problem. A fresh cookies.txt may help, but some videos will only "
-            "download reliably when the app runs locally from the same computer/browser session that can play the video."
-        )
-
-    elif "this video is drm protected" in lower and not ("please sign in" in lower or "403" in lower):
-        user_message = (
-            "yt-dlp reported this video as DRM-protected. If that report is accurate, this app cannot download it. "
-            "If you believe that is wrong, try a fresh cookies.txt file or run the app locally."
-        )
-
-    elif "requested format is not available" in lower:
-        user_message = (
-            "YouTube did not expose a downloadable format to this server. Try a lower resolution, upload fresh cookies, "
-            "or run the app locally."
-        )
-
-    else:
-        user_message = (
-            "The export could not be created for this link. Try a public non-restricted link, upload fresh cookies, "
-            "or run the app locally."
-        )
-
-    return f"{user_message}\n\nDetails from yt-dlp attempts:\n{joined}"
-
-def _bgutil_server_home() -> str | None:
-    """
-    Return the bgutil server home path if the compiled scripts exist.
-
-    Important:
-    bgutil's docs expect server_home to point to:
-      ~/bgutil-ytdlp-pot-provider/server
-    not the repository root.
-    """
-    server_dir = Path.home() / "bgutil-ytdlp-pot-provider" / "server"
-    if (server_dir / "build" / "generate_once.js").exists():
-        return str(server_dir)
-    return None
-
-
-def download_source_media(
+def build_ytdlp_command(
     url: str,
     temp_dir: str,
     output_type: str,
     max_height: int,
-    progress_hook,
-    converter_path: str,
-    user_cookie_text: str = "",
-) -> tuple[dict, Path]:
-    """
-    Download the raw source with yt-dlp, then FFmpeg re-encodes everything.
-    PO Tokens are provided by the bgutil plugin if it was set up successfully.
-    Cookies are used only when the user uploads cookies.txt or configures
-    YOUTUBE_COOKIES_TXT in Streamlit Secrets.
-    """
-    cookies_file = _write_cookies_to_tempfile(user_cookie_text)
-    using_cookies = cookies_file is not None
-    errors: list[str] = []
+    cookies_file: str | None,
+    browser_cookie_source: str,
+    use_browser_cookies: bool,
+    advanced_args: str,
+) -> list[str]:
+    if output_type == "video":
+        # Stacher-like default. Download best available source first.
+        fmt = f"bestvideo*[height<={max_height}]+bestaudio/best[height<={max_height}]/best"
+        merge_format = "mkv"
+    else:
+        fmt = "bestaudio[ext=m4a]/bestaudio/best"
+        merge_format = "mka"
 
-    # If bgutil scripts are compiled, tell the plugin exactly where the server folder is.
-    bgutil_home = _bgutil_server_home()
-    attempts = _build_attempts(output_type, max_height, using_cookies)
-
-    try:
-        for attempt_number, attempt in enumerate(attempts, start=1):
-            attempt_dir = Path(temp_dir) / f"attempt_{attempt_number}"
-            attempt_dir.mkdir(parents=True, exist_ok=True)
-
-            extractor_args: dict = {}
-
-            if bgutil_home:
-                extractor_args["youtubepot-bgutilscript"] = {
-                    "server_home": [bgutil_home]
-                }
-
-            attempt_ea = attempt.get("extractor_args", {})
-            for k, v in attempt_ea.items():
-                extractor_args[k] = v
-
-            attempt_without_ea = {
-                k: v for k, v in attempt.items() if k != "extractor_args"
-            }
-
-            options = {
-                "outtmpl": os.path.join(str(attempt_dir), "source.%(ext)s"),
-                "noplaylist": True,
-                "quiet": True,
-                "no_warnings": True,
-                "progress_hooks": [progress_hook],
-                "ffmpeg_location": converter_path,
-                "merge_output_format": "mkv",
-                "retries": 3,
-                "fragment_retries": 3,
-                "file_access_retries": 2,
-                "extractor_retries": 2,
-                "socket_timeout": 30,
-                "force_ipv4": True,
-                "sleep_interval_requests": 1,
-                "sleep_interval": 1,
-                "max_sleep_interval": 3,
-                "extractor_args": extractor_args,
-                "http_headers": {
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/125.0.0.0 Safari/537.36"
-                    ),
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
-                **attempt_without_ea,
-            }
-
-            if cookies_file:
-                options["cookiefile"] = cookies_file
-
-            try:
-                with YoutubeDL(options) as ydl:
-                    info = ydl.extract_info(url, download=True)
-
-                source_file = find_newest_media_file(str(attempt_dir))
-                return info, source_file
-
-            except Exception as e:
-                profile = attempt.get("extractor_args", {}).get("youtube", {}).get("player_client", ["default"])
-                errors.append(
-                    f"Attempt {attempt_number}; format={attempt.get('format')}; client={profile}: {e}"
-                )
-                shutil.rmtree(attempt_dir, ignore_errors=True)
-                continue
-
-        raise RuntimeError(_summarize_download_failure(errors, using_cookies))
-
-    finally:
-        if cookies_file:
-            try:
-                os.unlink(cookies_file)
-            except OSError:
-                pass
-
-def export_premiere_mp4(source_file: Path, output_file: Path, converter_path: str, crf: int) -> None:
-    """
-    Export MP4 with Premiere-friendly codecs:
-    - Video: H.264
-    - Audio: AAC
-    - Pixel format: yuv420p
-    - Fast-start metadata
-    """
     command = [
-        converter_path,
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        url,
+        "--no-playlist",
+        "--newline",
+        "--progress",
+        "--force-ipv4",
+        "--retries",
+        "5",
+        "--fragment-retries",
+        "5",
+        "--socket-timeout",
+        "30",
+        "--format",
+        fmt,
+        "--merge-output-format",
+        merge_format,
+        "--paths",
+        temp_dir,
+        "--output",
+        "source.%(ext)s",
+    ]
+
+    ffmpeg = find_exe("ffmpeg")
+    if ffmpeg:
+        command += ["--ffmpeg-location", ffmpeg]
+
+    if cookies_file:
+        command += ["--cookies", cookies_file]
+    elif use_browser_cookies and browser_cookie_source != "None":
+        # This is the key Stacher-like behavior.
+        # It only works when the Streamlit app runs locally on the user's own computer.
+        command += ["--cookies-from-browser", browser_cookie_source.lower()]
+
+    if advanced_args.strip():
+        # Basic advanced mode for users who already know yt-dlp args.
+        # shlex handles quoted values correctly on Unix and Windows.
+        import shlex
+        command += shlex.split(advanced_args.strip())
+
+    return command
+
+
+def ffmpeg_export_mp4(source_file: Path, output_file: Path, quality: str) -> None:
+    ffmpeg = find_exe("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg was not found.")
+
+    crf_map = {
+        "High quality": "18",
+        "Balanced": "21",
+        "Smaller file": "24",
+    }
+    crf = crf_map.get(quality, "21")
+
+    command = [
+        ffmpeg,
         "-y",
         "-i",
         str(source_file),
@@ -673,7 +479,7 @@ def export_premiere_mp4(source_file: Path, output_file: Path, converter_path: st
         "-preset",
         "medium",
         "-crf",
-        str(crf),
+        crf,
         "-c:a",
         "aac",
         "-b:a",
@@ -682,16 +488,16 @@ def export_premiere_mp4(source_file: Path, output_file: Path, converter_path: st
         "+faststart",
         str(output_file),
     ]
+    run_process(command)
 
-    run_command(command)
 
+def ffmpeg_export_m4a(source_file: Path, output_file: Path, bitrate: str) -> None:
+    ffmpeg = find_exe("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg was not found.")
 
-def export_premiere_audio(source_file: Path, output_file: Path, converter_path: str, bitrate: str) -> None:
-    """
-    Export audio as M4A/AAC, which is friendly for Premiere Pro workflows.
-    """
     command = [
-        converter_path,
+        ffmpeg,
         "-y",
         "-i",
         str(source_file),
@@ -706,125 +512,81 @@ def export_premiere_audio(source_file: Path, output_file: Path, converter_path: 
         "+faststart",
         str(output_file),
     ]
+    run_process(command)
 
-    run_command(command)
 
+def explain_download_error(error_text: str, cloud_mode: bool, used_browser_cookies: bool, used_cookie_file: bool) -> str:
+    lower = error_text.lower()
 
-def convert_url(
-    url: str,
-    output_choice: str,
-    max_height: int,
-    quality_label: str,
-    audio_bitrate: str,
-    converter_path: str,
-    user_cookie_text: str = "",
-):
-    temp_dir = tempfile.mkdtemp(prefix="carlos_converter_")
-
-    progress_bar = st.progress(0, text="Preparing your export...")
-    status_box = st.empty()
-
-    def progress_hook(d):
-        status = d.get("status")
-
-        if status == "downloading":
-            downloaded = d.get("downloaded_bytes", 0)
-            total = d.get("total_bytes") or d.get("total_bytes_estimate")
-
-            if total:
-                pct = min(downloaded / total, 1.0)
-                progress_bar.progress(
-                    pct * 0.70,
-                    text=f"Downloading source... {pct:.0%} ({human_bytes(downloaded)} / {human_bytes(total)})",
-                )
-            else:
-                progress_bar.progress(
-                    0.15,
-                    text=f"Downloading source... {human_bytes(downloaded)}",
-                )
-
-        elif status == "finished":
-            progress_bar.progress(0.72, text="Preparing editor-friendly export...")
-
-    try:
-        output_type = "video" if output_choice.startswith("MP4") else "audio"
-
-        info, source_file = download_source_media(
-            url=url,
-            temp_dir=temp_dir,
-            output_type=output_type,
-            max_height=max_height,
-            progress_hook=progress_hook,
-            converter_path=converter_path,
-            user_cookie_text=user_cookie_text,
+    if "sign in" in lower or "confirm you're not a bot" in lower or "confirm you’re not a bot" in lower:
+        if cloud_mode:
+            return (
+                "YouTube is asking the cloud server to sign in. Stacher avoids this more often because it runs on your own computer. "
+                "Add fresh cookies to Streamlit Secrets, upload cookies.txt in Advanced, or run this app locally and enable browser cookies."
+            )
+        return (
+            "YouTube is asking for a signed-in browser session. Enable browser cookies, close your browser if cookie extraction fails, "
+            "or upload a fresh cookies.txt file exported from a session that can play the video."
         )
 
-        title = info.get("title", "export") if isinstance(info, dict) else "export"
-        base_name = safe_filename(title)
+    if "http error 403" in lower or "forbidden" in lower:
+        if cloud_mode:
+            return (
+                "YouTube blocked the Streamlit Cloud server. This is the main difference from Stacher: Stacher downloads from your local computer, "
+                "not from a public datacenter IP. Add fresh cookies to Streamlit Secrets, upload cookies.txt in Advanced, or run the app locally for the Stacher-like behavior."
+            )
+        return (
+            "YouTube returned 403 from this machine. Try browser cookies, a fresh cookies.txt file, updating yt-dlp, or a different public link."
+        )
 
-        progress_bar.progress(0.82, text="Finishing export...")
+    if "drm" in lower:
+        return (
+            "yt-dlp reported DRM-protected media. This app cannot bypass DRM. If you think that report is wrong, run locally with fresh browser cookies."
+        )
 
-        if output_type == "video":
-            crf_by_label = {
-                "High quality": 18,
-                "Balanced": 21,
-                "Smaller file": 24,
-            }
-            crf = crf_by_label.get(quality_label, 21)
-            output_file = Path(temp_dir) / f"{base_name}_H264_AAC.mp4"
-            export_premiere_mp4(source_file, output_file, converter_path, crf)
-            mime_type = "video/mp4"
-            label = "Download MP4"
+    if "requested format is not available" in lower:
+        return (
+            "The requested format was not exposed to yt-dlp. Try a lower resolution, audio export, browser cookies, or a different public link."
+        )
 
-        else:
-            output_file = Path(temp_dir) / f"{base_name}_AAC.m4a"
-            export_premiere_audio(source_file, output_file, converter_path, audio_bitrate)
-            mime_type = "audio/mp4"
-            label = "Download M4A audio"
-
-        file_bytes = output_file.read_bytes()
-        file_size = human_bytes(output_file.stat().st_size)
-
-        progress_bar.progress(1.0, text="Export ready.")
-        status_box.success(f"Ready: {title}")
-
-        return {
-            "filename": output_file.name,
-            "data": file_bytes,
-            "size": file_size,
-            "mime": mime_type,
-            "label": label,
-        }
-
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    return "The export could not be created. Try running locally, updating yt-dlp, or using a different public link."
 
 
-# Set up the PO Token provider once at startup (runs git clone + npm build
-# the first time; subsequent container restarts use the cached result).
-_setup_pot_provider()
+cloud = is_streamlit_cloud()
 
-converter_path = find_converter_engine()
+if cloud:
+    st.markdown(
+        """
+        <div class="cloud-note">
+        <strong>Cloud mode detected.</strong> Streamlit Cloud downloads from a public server IP, so YouTube may block some videos with 403 or sign-in errors.
+        This version can use YouTube cookies stored in Streamlit Secrets as <code>YOUTUBE_COOKIES_TXT</code>.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown(
+        """
+        <div class="local-note">
+        <strong>Local mode detected.</strong> This is closest to Stacher: downloads run from your computer and can use your browser session.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 st.markdown('<div class="converter-card">', unsafe_allow_html=True)
 
 with st.form("converter_form"):
-    url = st.text_input(
-        "Paste your media link",
-        placeholder="https://www.youtube.com/watch?v=...",
-    )
+    url = st.text_input("Paste your media link", placeholder="https://www.youtube.com/watch?v=...")
 
     output_choice = st.radio(
         "Choose export type",
-        [
-            "MP4 video for Premiere Pro",
-            "Audio export for Premiere Pro",
-        ],
+        ["MP4 video for Premiere Pro", "Audio export for Premiere Pro"],
         horizontal=True,
     )
 
     col1, col2 = st.columns(2)
-
     with col1:
         max_height = st.selectbox(
             "Video resolution",
@@ -848,22 +610,71 @@ with st.form("converter_form"):
         disabled=output_choice.startswith("MP4"),
     )
 
-    with st.expander("Advanced: YouTube sign-in / 403 fix"):
+    save_mode = st.radio(
+        "Save method",
+        [
+            "Download button in browser",
+            "Save directly to local folder",
+        ],
+        index=0 if cloud else 1,
+        help=(
+            "Browser download works on cloud but loads the finished file into Streamlit memory. "
+            "Local folder save is closest to Stacher and works best when running this app locally."
+        ),
+    )
+
+    output_folder = st.text_input(
+        "Local output folder",
+        value=default_download_dir(),
+        disabled=save_mode != "Save directly to local folder",
+    )
+
+    with st.expander("Advanced: YouTube sign-in / 403 fixes"):
         st.caption(
-            "Only use this for videos you own, have permission to use, or can legitimately access in your browser."
+            "Stacher works well because it runs locally. On Streamlit Cloud, the best available option is using YouTube cookies stored in Streamlit Secrets."
         )
+
+        if secret_cookies_available():
+            st.success("YouTube cookies are configured in Streamlit Secrets.")
+        else:
+            st.warning(
+                "No valid YouTube cookies found in Streamlit Secrets. "
+                "Add YOUTUBE_COOKIES_TXT in Streamlit Cloud Settings → Secrets."
+            )
+
+        use_secret_cookies = st.checkbox(
+            "Use YouTube cookies from Streamlit Secrets",
+            value=secret_cookies_available(),
+            disabled=not secret_cookies_available(),
+            help="Recommended for Streamlit Cloud. Cookies are read from st.secrets and written to a temporary file only during conversion.",
+        )
+
+        use_browser_cookies = st.checkbox(
+            "Use cookies from my local browser",
+            value=not cloud,
+            disabled=cloud,
+            help="Only works when this Streamlit app is running locally on your computer.",
+        )
+
+        browser_cookie_source = st.selectbox(
+            "Browser",
+            ["Chrome", "Edge", "Firefox", "Brave", "Safari", "None"],
+            index=0,
+            disabled=(cloud or not use_browser_cookies),
+        )
+
         cookies_upload = st.file_uploader(
-            "Upload cookies.txt from a browser session that can play the video",
+            "Or upload cookies.txt",
             type=["txt"],
             accept_multiple_files=False,
-            help=(
-                "For YouTube sign-in / 403 errors, export cookies from a logged-in browser session "
-                "that can play the video, then upload the cookies.txt file here. The file is used only "
-                "for this conversion and is deleted immediately after."
-            ),
+            help="Use only for videos you own, have permission to use, or can legitimately access.",
         )
-        st.caption(
-            "No cookies are stored permanently. Streamlit Cloud may still be blocked for some videos."
+
+        advanced_args = st.text_input(
+            "Extra yt-dlp arguments",
+            value="",
+            placeholder="Example: --verbose",
+            help="Optional. For advanced users who already know yt-dlp flags.",
         )
 
     submitted = st.form_submit_button("Create Export")
@@ -872,66 +683,117 @@ st.markdown("</div>", unsafe_allow_html=True)
 
 
 if submitted:
-    uploaded_cookie_text = _read_uploaded_cookies(cookies_upload)
-
     if not url.strip():
         st.error("Paste a link first.")
+        st.stop()
 
-    elif not converter_path:
-        st.error("The export engine is not available on this server.")
-        st.info(
-            "If you are deploying on Streamlit Cloud, make sure your repo includes `packages.txt`."
+    if not find_exe("ffmpeg"):
+        st.error("FFmpeg was not found. Install FFmpeg first.")
+        st.stop()
+
+    progress = st.progress(0, text="Preparing your export...")
+    status = st.empty()
+
+    uploaded_cookie_text = read_uploaded_cookies(cookies_upload)
+    secret_cookie_text = read_secret_cookies() if "use_secret_cookies" in locals() and use_secret_cookies else ""
+
+    # Priority:
+    # 1. uploaded cookies.txt for this one conversion
+    # 2. YOUTUBE_COOKIES_TXT from Streamlit Secrets
+    # 3. local browser cookies, only when running locally
+    cookie_text = uploaded_cookie_text or secret_cookie_text
+
+    cookies_file = None
+    temp_dir = tempfile.mkdtemp(prefix="carlos_ytdlp_")
+
+    try:
+        if cookie_text:
+            cookies_file = write_temp_cookies(cookie_text)
+            if not cookies_file:
+                st.warning("The uploaded cookies.txt file did not look valid, so it was ignored.")
+
+        output_type = "video" if output_choice.startswith("MP4") else "audio"
+
+        command = build_ytdlp_command(
+            url=url.strip(),
+            temp_dir=temp_dir,
+            output_type=output_type,
+            max_height=int(max_height),
+            cookies_file=cookies_file,
+            browser_cookie_source=browser_cookie_source,
+            use_browser_cookies=use_browser_cookies,
+            advanced_args=advanced_args,
         )
 
-    else:
-        try:
-            with st.spinner("Creating your editor-friendly file..."):
-                result = convert_url(
-                    url=url.strip(),
-                    output_choice=output_choice,
-                    max_height=int(max_height),
-                    quality_label=quality_label,
-                    audio_bitrate=audio_bitrate,
-                    converter_path=converter_path,
-                    user_cookie_text=uploaded_cookie_text,
-                )
+        status.caption("Downloading source with yt-dlp...")
+        run_process(command, progress_bar=progress, status_box=status)
 
+        source_file = newest_file(temp_dir)
+
+        title_base = safe_filename(source_file.stem.replace("source", "export"))
+        if output_type == "video":
+            final_name = f"{title_base}_H264_AAC.mp4"
+            final_temp = Path(temp_dir) / final_name
+            progress.progress(0.96, text="Converting to Premiere-friendly MP4...")
+            ffmpeg_export_mp4(source_file, final_temp, quality_label)
+            mime = "video/mp4"
+            button_label = "Download MP4"
+        else:
+            final_name = f"{title_base}_AAC.m4a"
+            final_temp = Path(temp_dir) / final_name
+            progress.progress(0.96, text="Converting to Premiere-friendly M4A...")
+            ffmpeg_export_m4a(source_file, final_temp, audio_bitrate)
+            mime = "audio/mp4"
+            button_label = "Download M4A"
+
+        progress.progress(1.0, text="Export ready.")
+
+        if save_mode == "Save directly to local folder":
+            folder = Path(output_folder).expanduser()
+            folder.mkdir(parents=True, exist_ok=True)
+            final_path = folder / final_name
+            shutil.copy2(final_temp, final_path)
+            st.success(f"Saved to: {final_path}")
+            st.caption("This local-save mode is closest to Stacher.")
+
+        else:
+            data = final_temp.read_bytes()
             st.download_button(
-                label=f"{result['label']} ({result['size']})",
-                data=result["data"],
-                file_name=result["filename"],
-                mime=result["mime"],
+                label=f"{button_label} ({human_bytes(len(data))})",
+                data=data,
+                file_name=final_name,
+                mime=mime,
             )
 
-        except DownloadError as e:
-            st.error("This link could not be downloaded.")
-            with st.expander("Technical details"):
-                st.code(str(e), language="text")
-            st.info(
-                "Some websites block downloads, require login, or do not allow extraction."
+    except Exception as e:
+        error_text = str(e)
+        st.error("The export could not be created.")
+        st.info(
+            explain_download_error(
+                error_text=error_text,
+                cloud_mode=cloud,
+                used_browser_cookies=use_browser_cookies and not cloud,
+                used_cookie_file=bool(cookies_file),
             )
+        )
 
-        except Exception as e:
-            error_text = str(e)
-            st.error("The export could not be created.")
+        with st.expander("Technical details"):
+            st.code(error_text, language="text")
 
-            user_message = error_text.split("Details from yt-dlp attempts:", 1)[0].strip()
-            st.info(user_message)
-
-            if "cookies.txt" in user_message or "sign-in" in user_message.lower() or "sign in" in user_message.lower():
-                st.warning(
-                    "For best results, export cookies from a fresh private/incognito browser window "
-                    "where the video plays successfully, then upload that cookies.txt file in Advanced."
-                )
-
-            with st.expander("Technical details"):
-                st.code(error_text, language="text")
+    finally:
+        if cookies_file:
+            try:
+                os.unlink(cookies_file)
+            except OSError:
+                pass
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 st.markdown(
     """
     <div class="footer-note">
         Hola Vision Latina :). Use only for media you own, have permission to use, or can legitimately access.
+        This app does not bypass DRM, paywalls, private videos, or platform restrictions.
     </div>
     """,
     unsafe_allow_html=True,

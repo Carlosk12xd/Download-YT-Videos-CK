@@ -1,29 +1,25 @@
 # Carlos Knight Media Converter
 
-A professional Streamlit app powered by `yt-dlp` and FFmpeg.
+A Stacher-style Streamlit interface for `yt-dlp` and FFmpeg.
 
-## User-facing exports
+## What changed
 
-The app gives users two clean export choices:
+This version moves the app closer to how Stacher works:
 
-1. **MP4 video for Premiere Pro**
-   - Container: `.mp4`
-   - Video codec: H.264
-   - Audio codec: AAC
-   - Pixel format: yuv420p
-   - Fast-start enabled
+- Uses the yt-dlp command-line runner instead of only the Python API
+- Supports local browser cookies with `--cookies-from-browser`
+- Supports cookies.txt upload for cloud/sign-in cases
+- Supports saving directly to a local folder when run locally
+- Still supports browser download button for cloud deployment
+- Exports Premiere-friendly files:
+  - MP4: H.264 video + AAC audio + yuv420p + faststart
+  - M4A: AAC audio
 
-2. **Audio export for Premiere Pro**
-   - Container: `.m4a`
-   - Audio codec: AAC
+## Important difference from Stacher
 
-This is more Premiere Pro friendly than generic video/audio downloads.
+Stacher is a desktop GUI for yt-dlp. It runs downloads on your own computer. A Streamlit Cloud app runs downloads from a cloud server, which YouTube may block with 403/sign-in errors.
 
-## Files
-
-- `app.py`
-- `requirements.txt`
-- `packages.txt`
+For the most Stacher-like behavior, run this app locally.
 
 ## Run locally
 
@@ -32,7 +28,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-You also need FFmpeg installed locally.
+Install FFmpeg first.
 
 ### macOS
 
@@ -42,7 +38,7 @@ brew install ffmpeg
 
 ### Windows
 
-Install FFmpeg and add it to your PATH.
+Install FFmpeg and add it to PATH.
 
 ### Linux
 
@@ -51,58 +47,47 @@ sudo apt update
 sudo apt install ffmpeg
 ```
 
-## Streamlit Cloud deployment
+## Streamlit Cloud
 
-Upload these files to GitHub:
+Upload:
 
 ```text
 app.py
 requirements.txt
 packages.txt
-```
-
-The `packages.txt` file must contain:
-
-```text
-ffmpeg
-```
-
-Streamlit Cloud uses this to install FFmpeg as a system dependency.
-
-## 403 / Forbidden fix notes
-
-This version includes extra reliability improvements for public cloud hosting:
-
-- Adds `nodejs` in `packages.txt` so yt-dlp has a JavaScript runtime available for modern YouTube extraction.
-- Keeps `ffmpeg` in `packages.txt`.
-- Uses yt-dlp retry settings.
-- Tries multiple normal yt-dlp YouTube client profiles.
-- Falls back to safer combined MP4 formats when separate video/audio streams are blocked.
-- Shows a user-friendly message if the host blocks the cloud-server request.
-
-A 403 can still happen on some links because hosts may block Streamlit Cloud/server IPs, require login/cookies, restrict a video, or require validation that public apps should not bypass.
-
-## Default dark mode
-
-This version includes:
-
-```text
+README.md
 .streamlit/config.toml
 ```
 
-with Streamlit dark mode enabled by default.
+Cloud mode may work for many links, but YouTube may block cloud server IPs. For YouTube 403/sign-in errors, use local mode or upload a valid cookies.txt file for videos you own or have permission to access.
 
-## Latest fix: YouTube sign-in / 403 reliability
+## Legal / usage note
 
-This version fixes the main issues from the Streamlit logs:
+Use only for media you own, have permission to use, or can legitimately access. This app does not bypass DRM, paywalls, private videos, or platform restrictions.
 
-- Corrects the bgutil `server_home` path to point to `~/bgutil-ytdlp-pot-provider/server`
-- Clones the matching bgutil provider version `1.3.1`
-- Uses `npm ci` for a deterministic provider build
-- Removes baked-in anonymous cookies
-- Adds an Advanced cookies.txt uploader for per-conversion YouTube sign-in / 403 cases
-- Uses cookies only temporarily, then deletes the temp file
-- Avoids client profiles that can produce misleading DRM errors
-- Aggregates yt-dlp attempt errors into a clearer message
+## Streamlit Cloud + YouTube cookies
 
-Some YouTube videos may still fail on Streamlit Cloud because YouTube may reject datacenter/cloud IP addresses. In that case, running the app locally with fresh cookies from the same browser session is the reliable path.
+This version supports YouTube cookies from Streamlit Secrets.
+
+In Streamlit Cloud:
+
+1. Open your app.
+2. Go to **Settings**.
+3. Open **Secrets**.
+4. Paste your cookies using this format:
+
+```toml
+YOUTUBE_COOKIES_TXT = """
+# Netscape HTTP Cookie File
+.youtube.com	TRUE	/	TRUE	1795628587	VISITOR_INFO1_LIVE	replace_with_your_value
+.youtube.com	TRUE	/	TRUE	1814632710	__Secure-3PSID	replace_with_your_value
+"""
+```
+
+Do **not** commit real cookies to GitHub.
+
+The app reads `YOUTUBE_COOKIES_TXT` with `st.secrets`, writes it to a temporary file only during conversion, passes it to yt-dlp with `--cookies`, and then deletes the temp file.
+
+### Important
+
+Cookies can help with YouTube sign-in / 403 / bot-check issues, but they do not guarantee success if YouTube blocks Streamlit Cloud's server IP or if the video is private, deleted, truly DRM-protected, or unavailable to that account.
