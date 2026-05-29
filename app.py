@@ -419,12 +419,20 @@ def _build_attempts(output_type: str, max_height: int) -> list[dict]:
             "bestaudio/best",
         ]
 
-    # Client profiles ordered by success rate from cloud IPs (2025).
-    # The bgutil POT plugin hooks in automatically regardless of client chosen.
+    # Client profiles ordered by cloud-server success rate (2025/2026).
+    #
+    # ios/android: use mobile API paths that bypass YouTube's cloud-IP
+    # bot detection even without PO tokens. These are the most reliable
+    # clients for public videos from cloud servers.
+    #
+    # web_creator/mweb/web: web clients that need PO tokens on cloud IPs.
+    #
+    # The bgutil POT plugin hooks in automatically for all clients.
     client_profiles = [
+        {"extractor_args": {"youtube": {"player_client": ["ios"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["android"]}}},
         {"extractor_args": {"youtube": {"player_client": ["web_creator"]}}},
         {"extractor_args": {"youtube": {"player_client": ["mweb"]}}},
-        {"extractor_args": {"youtube": {"player_client": ["android"]}}},
         {"extractor_args": {"youtube": {"player_client": ["web"]}}},
         {"extractor_args": {"youtube": {"player_client": ["tv_embedded"]}}},
         {},  # yt-dlp default
@@ -435,6 +443,14 @@ def _build_attempts(output_type: str, max_height: int) -> list[dict]:
         for client in client_profiles:
             attempts.append({"format": fmt, **client})
     return attempts
+
+
+def _bgutil_server_home() -> str | None:
+    """Return the bgutil server home path if the compiled scripts exist."""
+    path = Path.home() / "bgutil-ytdlp-pot-provider"
+    if (path / "server" / "build" / "generate_once.js").exists():
+        return str(path)
+    return None
 
 
 def download_source_media(
@@ -454,10 +470,26 @@ def download_source_media(
     last_error: Exception | None = None
     attempts = _build_attempts(output_type, max_height)
 
+    # If bgutil scripts are compiled, tell the plugin exactly where they are.
+    bgutil_home = _bgutil_server_home()
+
     try:
         for attempt_number, attempt in enumerate(attempts, start=1):
             attempt_dir = Path(temp_dir) / f"attempt_{attempt_number}"
             attempt_dir.mkdir(parents=True, exist_ok=True)
+
+            # Build extractor_args: merge bgutil server_home (if available)
+            # with the per-attempt youtube player_client arg.
+            extractor_args: dict = {}
+            if bgutil_home:
+                extractor_args["youtubepot-bgutilscript"] = {
+                    "server_home": [bgutil_home]
+                }
+            attempt_ea = attempt.get("extractor_args", {})
+            for k, v in attempt_ea.items():
+                extractor_args[k] = v
+            attempt_without_ea = {k: v for k, v in attempt.items()
+                                   if k != "extractor_args"}
 
             options = {
                 "outtmpl": os.path.join(str(attempt_dir), "source.%(ext)s"),
@@ -474,6 +506,7 @@ def download_source_media(
                 "extractor_retries": 3,
                 "socket_timeout": 30,
                 "cookiefile": cookies_file,
+                "extractor_args": extractor_args,
                 "http_headers": {
                     "User-Agent": (
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -482,7 +515,7 @@ def download_source_media(
                     ),
                     "Accept-Language": "en-US,en;q=0.9",
                 },
-                **attempt,
+                **attempt_without_ea,
             }
 
             try:
