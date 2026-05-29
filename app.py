@@ -282,9 +282,21 @@ def run_command(command: list[str]) -> None:
         raise RuntimeError(details)
 
 
-# Anonymous visitor cookies exported from a private/incognito YouTube session.
-# These carry no account information — they just prove to YouTube that the
-# request looks like a real browser, which reduces 403 rejections from cloud IPs.
+# ---------------------------------------------------------------------------
+# PO Token (Proof-of-Origin) provider setup
+# ---------------------------------------------------------------------------
+# bgutil-ytdlp-pot-provider clones a small Node.js script at first startup,
+# then generates fresh PO Tokens on every yt-dlp call. PO Tokens prove the
+# request came from a real browser — no account, no cookies, no expiry.
+#
+# Node.js is installed via packages.txt. The one-time npm install + TypeScript
+# compile runs automatically when the app starts for the first time on a new
+# container. Subsequent calls hit the @st.cache_resource cache instantly.
+# ---------------------------------------------------------------------------
+
+# Anonymous visitor cookies from an incognito YouTube session (no account).
+# Used as a secondary signal alongside PO Tokens, and as a fallback if the
+# POT provider setup fails. Expire ~2027 — harmless to refresh when needed.
 _BUILTIN_COOKIES = """# Netscape HTTP Cookie File
 # https://curl.haxx.se/rfc/cookie_spec.html
 # This is a generated file! Do not edit.
@@ -300,7 +312,7 @@ _BUILTIN_COOKIES = """# Netscape HTTP Cookie File
 
 
 def _write_cookies_to_tempfile() -> str:
-    """Write the built-in cookies to a temp file and return its path."""
+    """Write built-in cookies to a temp file and return its path."""
     tmp = tempfile.NamedTemporaryFile(
         delete=False, suffix=".txt", prefix="yt_cookies_", mode="w"
     )
@@ -308,6 +320,62 @@ def _write_cookies_to_tempfile() -> str:
     tmp.flush()
     tmp.close()
     return tmp.name
+
+
+@st.cache_resource(show_spinner=False)
+def _setup_pot_provider() -> bool:
+    """
+    Clone bgutil-ytdlp-pot-provider and compile its TypeScript once per
+    container lifetime. Returns True on success, False on failure (the app
+    falls back to cookies-only mode automatically).
+
+    Steps performed on first call:
+      1. git clone Brainicism/bgutil-ytdlp-pot-provider -> ~/bgutil-ytdlp-pot-provider
+      2. npm install  (in server/ subdirectory)
+      3. npx tsc      (compiles TypeScript to build/*)
+    Node.js is provided by packages.txt so npm/npx are always available.
+    """
+    home = Path.home()
+    server_dir = home / "bgutil-ytdlp-pot-provider" / "server"
+    sentinel = server_dir / "build" / "generate_once.js"
+
+    if sentinel.exists():
+        return True  # Already built on this container — nothing to do.
+
+    try:
+        clone_dir = home / "bgutil-ytdlp-pot-provider"
+        if not clone_dir.exists():
+            subprocess.run(
+                [
+                    "git", "clone", "--depth", "1",
+                    "https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git",
+                    str(clone_dir),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=120,
+            )
+
+        subprocess.run(
+            ["npm", "install", "--prefer-offline"],
+            check=True,
+            capture_output=True,
+            cwd=str(server_dir),
+            timeout=240,
+        )
+
+        subprocess.run(
+            ["npx", "--yes", "tsc"],
+            check=True,
+            capture_output=True,
+            cwd=str(server_dir),
+            timeout=120,
+        )
+
+        return sentinel.exists()
+
+    except Exception:
+        return False
 
 
 def _build_attempts(output_type: str, max_height: int) -> list[dict]:
@@ -328,6 +396,7 @@ def _build_attempts(output_type: str, max_height: int) -> list[dict]:
         ]
 
     # Client profiles ordered by success rate from cloud IPs (2025).
+    # The bgutil POT plugin hooks in automatically regardless of client chosen.
     client_profiles = [
         {"extractor_args": {"youtube": {"player_client": ["web_creator"]}}},
         {"extractor_args": {"youtube": {"player_client": ["mweb"]}}},
@@ -354,7 +423,8 @@ def download_source_media(
 ) -> tuple[dict, Path]:
     """
     Download the raw source with yt-dlp, then FFmpeg re-encodes everything.
-    Uses built-in anonymous cookies automatically — no user action needed.
+    PO Tokens are provided automatically by the bgutil plugin (if set up).
+    Anonymous cookies are always sent as a supplementary signal.
     """
     cookies_file = _write_cookies_to_tempfile()
     last_error: Exception | None = None
@@ -567,6 +637,10 @@ def convert_url(
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
+
+# Set up the PO Token provider once at startup (runs git clone + npm build
+# the first time; subsequent container restarts use the cached result).
+_setup_pot_provider()
 
 converter_path = find_converter_engine()
 
