@@ -282,49 +282,65 @@ def run_command(command: list[str]) -> None:
         raise RuntimeError(details)
 
 
-def get_yt_dlp_attempts(output_type: str, max_height: int) -> list[dict]:
+# Anonymous visitor cookies exported from a private/incognito YouTube session.
+# These carry no account information — they just prove to YouTube that the
+# request looks like a real browser, which reduces 403 rejections from cloud IPs.
+_BUILTIN_COOKIES = """# Netscape HTTP Cookie File
+# https://curl.haxx.se/rfc/cookie_spec.html
+# This is a generated file! Do not edit.
+
+.youtube.com	TRUE	/	TRUE	1795623095	__Secure-YNID	18.YT=xhDdq_iwRMdcYKXazaIKAIm4yu-PoYOKWwga2oPTvpHat9gH95Wpq8KmKDweiyd9EyvijacSPxln2CTGfPOw_--eMDBGPvrakz13X0sADVXnFhXSbfXQUkO3Us980vpMMmGWCtM6OQkYu-wKTPfyzEsTZD61duip6v73EjNS51joVIPqf5kImH3XAdf77M0ne0VQ7WszaIoXJ1XJyKPG3FKyhihxG0Wpur1YnfBAMTBT9q96eyWWm_iffqkFIkpl73j4R_XqU53RXo9fgJVap_ZxqgKSLLnlygL2SJwMfwnOVsBIEKW62RxdbfCxDC2rb7iDU9FukhW7eBHrn5g0iQ
+.youtube.com	TRUE	/	TRUE	1780072896	GPS	1
+.youtube.com	TRUE	/	TRUE	0	YSC	--KZVBEDOnE
+.youtube.com	TRUE	/	TRUE	1795623097	VISITOR_INFO1_LIVE	YtVh-_hI0PU
+.youtube.com	TRUE	/	TRUE	1795623097	VISITOR_PRIVACY_METADATA	CgJVUxIEGgAgSA%3D%3D
+.youtube.com	TRUE	/	TRUE	1814631097	PREF	f4=4000000&f6=40000000&tz=America.Denver
+.youtube.com	TRUE	/	TRUE	1795623096	__Secure-ROLLOUT_TOKEN	CKHmiYLV7PSqyAEQhILNyvHelAMYhvCFy_HelAM%3D
+"""
+
+
+def _write_cookies_to_tempfile() -> str:
+    """Write the built-in cookies to a temp file and return its path."""
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False, suffix=".txt", prefix="yt_cookies_", mode="w"
+    )
+    tmp.write(_BUILTIN_COOKIES)
+    tmp.flush()
+    tmp.close()
+    return tmp.name
+
+
+def _build_attempts(output_type: str, max_height: int) -> list[dict]:
     """
-    Build multiple yt-dlp attempts.
-
-    Why:
-    Some hosts, especially YouTube, may reject one client profile or one format URL
-    with HTTP 403 even when another format/client works. These attempts do not bypass
-    DRM, paywalls, logins, or private content. They simply let yt-dlp try normal
-    public client profiles and safer format fallbacks.
-
-    The po_token + visitor_data (obtained via cookies) is the most reliable fix
-    for 403s on YouTube from cloud servers as of 2024–2025.
+    Return download attempt configs ordered by cloud-server success rate.
+    Format selection is intentionally permissive — yt-dlp just fetches the raw
+    bits, and FFmpeg re-encodes everything into the final clean MP4 or M4A.
     """
     if output_type == "video":
-        format_attempts = [
-            # Prefer a single combined mp4 stream — avoids the DASH 403 that
-            # separate video+audio streams often trigger on cloud IPs.
-            f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]/best[ext=mp4]/best",
-            f"b[height<={max_height}]/best",
+        format_selectors = [
+            # Single combined stream first — no DASH merge, fewer 403s.
+            f"best[height<={max_height}]/best",
+            "best",
         ]
     else:
-        format_attempts = [
-            "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+        format_selectors = [
+            "bestaudio/best",
         ]
 
-    # Most reliable clients for authenticated/cloud requests, ordered by success rate.
-    client_attempts = [
-        {"extractor_args": {"youtube": {"player_client": ["web"]}}},
+    # Client profiles ordered by success rate from cloud IPs (2025).
+    client_profiles = [
+        {"extractor_args": {"youtube": {"player_client": ["web_creator"]}}},
         {"extractor_args": {"youtube": {"player_client": ["mweb"]}}},
         {"extractor_args": {"youtube": {"player_client": ["android"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["web"]}}},
         {"extractor_args": {"youtube": {"player_client": ["tv_embedded"]}}},
-        {},  # yt-dlp default as final fallback
+        {},  # yt-dlp default
     ]
 
     attempts = []
-    for format_selector in format_attempts:
-        for client_options in client_attempts:
-            attempt = {
-                "format": format_selector,
-                **client_options,
-            }
-            attempts.append(attempt)
-
+    for fmt in format_selectors:
+        for client in client_profiles:
+            attempts.append({"format": fmt, **client})
     return attempts
 
 
@@ -335,69 +351,70 @@ def download_source_media(
     max_height: int,
     progress_hook,
     converter_path: str,
-    cookies_file: str | None = None,
 ) -> tuple[dict, Path]:
     """
-    Use yt-dlp to download the best available source.
-    Then FFmpeg exports it into Premiere-friendly H.264/AAC MP4 or AAC M4A.
-
-    cookies_file: path to a Netscape-format cookies.txt exported from your browser.
-    Providing cookies from a logged-in YouTube session is the most reliable fix
-    for HTTP 403 errors when running on a cloud server.
+    Download the raw source with yt-dlp, then FFmpeg re-encodes everything.
+    Uses built-in anonymous cookies automatically — no user action needed.
     """
+    cookies_file = _write_cookies_to_tempfile()
     last_error: Exception | None = None
-    attempts = get_yt_dlp_attempts(output_type, max_height)
+    attempts = _build_attempts(output_type, max_height)
 
-    for attempt_number, attempt in enumerate(attempts, start=1):
-        attempt_dir = Path(temp_dir) / f"attempt_{attempt_number}"
-        attempt_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        for attempt_number, attempt in enumerate(attempts, start=1):
+            attempt_dir = Path(temp_dir) / f"attempt_{attempt_number}"
+            attempt_dir.mkdir(parents=True, exist_ok=True)
 
-        options = {
-            "outtmpl": os.path.join(str(attempt_dir), "source.%(ext)s"),
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "progress_hooks": [progress_hook],
-            "ffmpeg_location": converter_path,
-            "merge_output_format": "mkv" if output_type == "video" else None,
-            "retries": 5,
-            "fragment_retries": 5,
-            "file_access_retries": 3,
-            "extractor_retries": 3,
-            "socket_timeout": 30,
-            "http_headers": {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125.0.0.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-            "cookiefile": cookies_file,
-            **attempt,
-        }
+            options = {
+                "outtmpl": os.path.join(str(attempt_dir), "source.%(ext)s"),
+                "noplaylist": True,
+                "quiet": True,
+                "no_warnings": True,
+                "progress_hooks": [progress_hook],
+                "ffmpeg_location": converter_path,
+                # mkv container for merging — FFmpeg converts to clean MP4/M4A.
+                "merge_output_format": "mkv",
+                "retries": 5,
+                "fragment_retries": 5,
+                "file_access_retries": 3,
+                "extractor_retries": 3,
+                "socket_timeout": 30,
+                "cookiefile": cookies_file,
+                "http_headers": {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/125.0.0.0 Safari/537.36"
+                    ),
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+                **attempt,
+            }
 
-        # Remove None values to avoid passing unnecessary config.
-        options = {key: value for key, value in options.items() if value is not None}
+            try:
+                with YoutubeDL(options) as ydl:
+                    info = ydl.extract_info(url, download=True)
 
+                source_file = find_newest_media_file(str(attempt_dir))
+                return info, source_file
+
+            except Exception as e:
+                last_error = e
+                shutil.rmtree(attempt_dir, ignore_errors=True)
+                continue
+
+        raise RuntimeError(
+            "Could not download the video after multiple attempts. "
+            "Common causes: the video host blocks cloud-server IPs, the video requires "
+            "a login, is private/restricted, or is DRM-protected. "
+            f"Last error: {last_error}"
+        )
+    finally:
+        # Always delete the temp cookies file immediately after use.
         try:
-            with YoutubeDL(options) as ydl:
-                info = ydl.extract_info(url, download=True)
-
-            source_file = find_newest_media_file(str(attempt_dir))
-            return info, source_file
-
-        except Exception as e:
-            last_error = e
-            shutil.rmtree(attempt_dir, ignore_errors=True)
-            continue
-
-    raise RuntimeError(
-        "The site rejected the download request after multiple attempts. "
-        "This often happens when the video host blocks cloud-server downloads, "
-        "requires login/cookies, requires extra client validation, or restricts that video. "
-        f"Last error: {last_error}"
-    )
+            os.unlink(cookies_file)
+        except OSError:
+            pass
 
 
 def export_premiere_mp4(source_file: Path, output_file: Path, converter_path: str, crf: int) -> None:
@@ -470,7 +487,6 @@ def convert_url(
     quality_label: str,
     audio_bitrate: str,
     converter_path: str,
-    cookies_file: str | None = None,
 ):
     temp_dir = tempfile.mkdtemp(prefix="carlos_converter_")
 
@@ -509,7 +525,6 @@ def convert_url(
             max_height=max_height,
             progress_hook=progress_hook,
             converter_path=converter_path,
-            cookies_file=cookies_file,
         )
 
         title = info.get("title", "export") if isinstance(info, dict) else "export"
@@ -597,20 +612,6 @@ with st.form("converter_form"):
         disabled=output_choice.startswith("MP4"),
     )
 
-    with st.expander("🍪 YouTube cookies (fixes 403 errors on cloud)"):
-        st.markdown(
-            "If you see **403 Forbidden** errors, upload a `cookies.txt` from your "
-            "logged-in YouTube session. This lets the app download as you.\n\n"
-            "**How to export cookies:** Install the "
-            "[Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) "
-            "Chrome extension, go to youtube.com while logged in, click the extension, and export."
-        )
-        cookies_upload = st.file_uploader(
-            "Upload cookies.txt (optional)",
-            type=["txt"],
-            help="Netscape-format cookies file exported from your browser.",
-        )
-
     submitted = st.form_submit_button("Create Export")
 
 st.markdown("</div>", unsafe_allow_html=True)
@@ -628,17 +629,6 @@ if submitted:
 
     else:
         try:
-            # Save uploaded cookies to a temp file if provided
-            cookies_path: str | None = None
-            if cookies_upload is not None:
-                cookies_tmp = tempfile.NamedTemporaryFile(
-                    delete=False, suffix=".txt", prefix="yt_cookies_"
-                )
-                cookies_tmp.write(cookies_upload.getvalue())
-                cookies_tmp.flush()
-                cookies_tmp.close()
-                cookies_path = cookies_tmp.name
-
             with st.spinner("Creating your editor-friendly file..."):
                 result = convert_url(
                     url=url.strip(),
@@ -647,14 +637,7 @@ if submitted:
                     quality_label=quality_label,
                     audio_bitrate=audio_bitrate,
                     converter_path=converter_path,
-                    cookies_file=cookies_path,
                 )
-
-            if cookies_path:
-                try:
-                    os.unlink(cookies_path)
-                except OSError:
-                    pass
 
             st.download_button(
                 label=f"{result['label']} ({result['size']})",
