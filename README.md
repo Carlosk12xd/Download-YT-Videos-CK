@@ -68,3 +68,25 @@ ffmpeg
 ```
 
 Streamlit Cloud uses this to install FFmpeg as a system dependency.
+
+## Default dark mode
+
+This version includes a Streamlit theme config so the app opens in dark mode by default.
+
+The dark mode config lives here:
+
+```text
+.streamlit/config.toml
+```
+
+Theme settings:
+
+```toml
+[theme]
+base = "dark"
+primaryColor = "#8B5CF6"
+backgroundColor = "#0F172A"
+secondaryBackgroundColor = "#1E293B"
+textColor = "#F8FAFC"
+font = "sans serif"
+```
